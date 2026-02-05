@@ -1,13 +1,14 @@
 use anyhow::{Ok, Result, bail};
 use libc::{
     AF_INET, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLIN, INADDR_ANY, SOCK_NONBLOCK, SOCK_STREAM,
-    accept4, bind, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
+    accept4, bind, c_int, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
     listen, read, sockaddr, sockaddr_in, socket,
 };
 
 use std::{
     io::{Error, ErrorKind},
     ptr::null_mut,
+    u16,
 };
 fn main() -> Result<()> {
     //epoll instantiate
@@ -33,90 +34,15 @@ fn main() -> Result<()> {
             let flags = epoll_event_recieved[i].events;
             let concerned_fd = epoll_event_recieved[i].u64;
             println!("{:?}", epoll_event_recieved[i]);
-            if flags & EPOLLIN as u32 != 0 {
-                if concerned_fd != socket_fd as u64 {
-                    //this event concerns a connection: either FIN or regular data
-                    let mut buf: [u8; 256] = [0; 256];
-                    //make sure to drain completely
-                    let mut first_read_response: Option<isize> = None;
-                    loop {
-                        //VERY IMP: READ ERROR DOES NOT NECESSERILIY MEAN ERROR, IT JUST MEANS THERE IS NO MORE DATA **YET**
-                        let read_response = unsafe {
-                            read(concerned_fd as i32, buf.as_mut_ptr() as *mut _, buf.len())
-                        };
-                        let is_noncarryable_error = read_response == -1
-                            && Error::last_os_error().kind() != ErrorKind::WouldBlock;
-                        if first_read_response.is_none() || is_noncarryable_error {
-                            //why the second condition ? because if its a genuine error, no point in continuing
-                            first_read_response = Some(read_response)
-                        }
-                        if read_response <= 0 {
-                            //EOF or ERROR, no need to continue either way
-                            break;
-                        }
-                    }
-                    if first_read_response.unwrap() == 0 {
-                        //EOF, CLIENT SENT A FIN
-                        println!(
-                            "the connection {concerned_fd} sent a FIN. Removing and closing it"
-                        );
-                        let con_index = open_connections
-                            .iter()
-                            .position(|&e| e == concerned_fd as i32)
-                            .unwrap();
-                        open_connections.remove(con_index);
-                        unsafe {
-                            epoll_ctl(
-                                epoll_fd,
-                                EPOLL_CTL_DEL,
-                                concerned_fd as i32,
-                                &mut connection_event(concerned_fd),
-                            )
-                        };
-                        unsafe { close(concerned_fd as i32) };
-                    } else if first_read_response.unwrap() == -1 {
-                        //most likely: it's a blockin call prevented, try again later. might be a genuine error in some cases
-                        println!("{}", Error::last_os_error());
-                        println!("error reading connection {concerned_fd}");
-                    } else {
-                        //everythin was fine
-                        println!(
-                            "connection {concerned_fd} sent some data: {:?}",
-                            String::from_utf8(buf.to_vec())
-                        )
-                    }
-                } else {
-                    //connection request
-                    let connection_fd =
-                        unsafe { accept4(socket_fd, null_mut(), null_mut(), SOCK_NONBLOCK) };
-                    if (connection_fd > 0)
-                        && (unsafe {
-                            epoll_ctl(
-                                epoll_fd,
-                                EPOLL_CTL_ADD,
-                                connection_fd,
-                                &mut connection_event(connection_fd as u64),
-                            )
-                        }) > -1
-                    {
-                        println!("new connection accepted: {}", connection_fd);
-                        open_connections.push(connection_fd);
-                    } else {
-                        println!("something went wrong registering a new connection")
-                    };
-                }
-            } else {
-                println!("recieved something else")
-            }
+            event_handler(
+                flags,
+                concerned_fd as i32,
+                socket_fd,
+                epoll_fd,
+                &mut open_connections,
+            )?;
         }
         println!("recieved!")
-    }
-}
-
-fn connection_event(con_fd: u64) -> epoll_event {
-    epoll_event {
-        events: (EPOLLIN as u32),
-        u64: con_fd,
     }
 }
 
@@ -173,4 +99,124 @@ fn register_interest(epoll_fd: i32, concerned_fd: i32, event: &mut epoll_event) 
     } else {
         Ok(())
     }
+}
+
+fn unregister_interest(epoll_fd: i32, concerned_fd: i32, event: &mut epoll_event) -> Result<()> {
+    if unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_DEL, concerned_fd, event) } < 0 {
+        bail!(
+            "could not unregister interest in events associated with FD: {concerned_fd}, error: {}",
+            Error::last_os_error()
+        );
+    } else {
+        Ok(())
+    }
+}
+
+fn event_handler(
+    flags: u32,
+    concerned_fd: i32,
+    socket_fd: i32,
+    epoll_fd: i32,
+    open_connections: &mut Vec<i32>,
+) -> Result<()> {
+    if has_flag(flags, EPOLLIN) {
+        if concerned_fd != socket_fd {
+            let recieved_data = handle_data_on_connection(concerned_fd, open_connections, epoll_fd);
+            if recieved_data.is_ok(){
+                println!("{}",recieved_data.unwrap());
+            };
+        } else {
+            //connection request
+            handle_new_connection_request(socket_fd, epoll_fd, open_connections)?;
+        }
+    };
+    Ok(())
+}
+
+fn handle_new_connection_request(
+    socket_fd: i32,
+    epoll_fd: i32,
+    open_connections: &mut Vec<i32>,
+) -> Result<()> {
+    let connection_fd = unsafe { accept4(socket_fd, null_mut(), null_mut(), SOCK_NONBLOCK) };
+    if connection_fd == -1 {
+        bail!("could not accept a connection request")
+    }
+    register_interest(
+        epoll_fd,
+        connection_fd,
+        &mut new_epoll_event(EPOLLIN, connection_fd),
+    )?;
+    open_connections.push(connection_fd);
+    Ok(())
+}
+
+fn handle_data_on_connection(
+    connection_fd: i32,
+    open_connections: &mut Vec<i32>,
+    epoll_fd: i32,
+) -> Result<String> {
+    //this event concerns a connection: either FIN or regular data
+    let mut buf: [u8; 256] = [0; 256];
+    //make sure to drain completely
+    let first_read_response = read_connection_fd(&mut buf, connection_fd);
+    if first_read_response == 0 {
+        //EOF, CLIENT SENT A FIN
+        println!("the connection {connection_fd} sent a FIN. Removing and closing it");
+        close_connection(open_connections, connection_fd, epoll_fd)?;
+        bail!("0")
+    } else if first_read_response == -1 {
+        //most likely: it's a blockin call prevented, try again later. might be a genuine error in some cases
+        println!("error reading connection {connection_fd}");
+        close_connection(open_connections, connection_fd, epoll_fd)?;
+        bail!("-1")
+    } else {
+        //everythin was fine
+        println!("connection {connection_fd} sent some data");
+        //try to convert to utf-8
+        let text = String::from_utf8(buf.to_vec())?;
+        Ok(text)
+    }
+}
+
+fn has_flag(flags_bitmask: u32, flag_to_check: c_int) -> bool {
+    flags_bitmask & flag_to_check as u32 != 0
+}
+
+fn read_connection_fd(buf: &mut [u8; 256], concerned_fd: i32) -> isize {
+    let mut first_read_response: Option<isize> = None;
+    loop {
+        //VERY IMP: READ ERROR DOES NOT NECESSERILIY MEAN ERROR, IT JUST MEANS THERE IS NO MORE DATA **YET**
+        let read_response = unsafe { read(concerned_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        let is_noncarryable_error =
+            read_response == -1 && Error::last_os_error().kind() != ErrorKind::WouldBlock;
+        if first_read_response.is_none() || is_noncarryable_error {
+            //why the second condition ? because if its a genuine error, no point in continuing
+            first_read_response = Some(read_response)
+        }
+        if read_response <= 0 {
+            //EOF or ERROR, no need to continue either way
+            break;
+        }
+    }
+    first_read_response.unwrap()
+}
+
+fn close_connection(
+    open_connections: &mut Vec<i32>,
+    connection_fd: i32,
+    epoll_fd: i32,
+) -> Result<()> {
+    let con_index = open_connections
+        .iter()
+        .position(|&e| e == connection_fd)
+        .unwrap();
+    open_connections.remove(con_index);
+    unregister_interest(
+        epoll_fd,
+        connection_fd,
+        &mut new_epoll_event(EPOLLIN, connection_fd),
+    )?;
+    unsafe { close(connection_fd) };
+    Ok(())
 }
