@@ -4,12 +4,17 @@ use libc::{
     accept4, bind, c_int, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
     listen, read, sockaddr, sockaddr_in, socket,
 };
-
+#[path = "../epoll.rs"]
+mod epoll;
+use epoll::{register_interest, unregister_interest, new_epoll_event};
 use std::{
     io::{Error, ErrorKind},
     ptr::null_mut,
     u16,
 };
+
+use crate::epoll::has_flag;
+
 fn main() -> Result<()> {
     //epoll instantiate
     let epoll_fd = unsafe { epoll_create1(0) };
@@ -22,18 +27,18 @@ fn main() -> Result<()> {
     let mut event = new_epoll_event(EPOLLIN, socket_fd);
     register_interest(epoll_fd, socket_fd, &mut event)?;
 
-    let mut epoll_event_recieved = [new_epoll_event(0, 0); 10];
+    let mut epoll_event_recieved = [new_epoll_event(0, 0); 50000];
     let mut open_connections: Vec<i32> = Vec::new();
 
     loop {
         println!("listening");
         let events_count =
-            unsafe { epoll_wait(epoll_fd, epoll_event_recieved.as_mut_ptr(), 10, -1) };
+            unsafe { epoll_wait(epoll_fd, epoll_event_recieved.as_mut_ptr(), 50000, -1) };
         println!("woke up for a total of {events_count} events");
         for i in 0..events_count as usize {
             let flags = epoll_event_recieved[i].events;
             let concerned_fd = epoll_event_recieved[i].u64;
-            println!("{:?}", epoll_event_recieved[i]);
+            // println!("{:?}", epoll_event_recieved[i]);
             event_handler(
                 flags,
                 concerned_fd as i32,
@@ -83,34 +88,6 @@ fn start_listening(port: u16) -> Result<i32> {
     Ok(socket_fd)
 }
 
-fn new_epoll_event(events_interested_in: i32, identifier: i32) -> epoll_event {
-    epoll_event {
-        events: events_interested_in as u32,
-        u64: identifier as u64,
-    }
-}
-
-fn register_interest(epoll_fd: i32, concerned_fd: i32, event: &mut epoll_event) -> Result<()> {
-    if unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_ADD, concerned_fd, event) } < 0 {
-        bail!(
-            "could not register interest in events associated with FD: {concerned_fd}, error: {}",
-            Error::last_os_error()
-        );
-    } else {
-        Ok(())
-    }
-}
-
-fn unregister_interest(epoll_fd: i32, concerned_fd: i32, event: &mut epoll_event) -> Result<()> {
-    if unsafe { epoll_ctl(epoll_fd, EPOLL_CTL_DEL, concerned_fd, event) } < 0 {
-        bail!(
-            "could not unregister interest in events associated with FD: {concerned_fd}, error: {}",
-            Error::last_os_error()
-        );
-    } else {
-        Ok(())
-    }
-}
 
 fn event_handler(
     flags: u32,
@@ -140,7 +117,7 @@ fn handle_new_connection_request(
 ) -> Result<()> {
     let connection_fd = unsafe { accept4(socket_fd, null_mut(), null_mut(), SOCK_NONBLOCK) };
     if connection_fd == -1 {
-        bail!("could not accept a connection request")
+        bail!("could not accept a connection request: {}", Error::last_os_error());
     }
     register_interest(
         epoll_fd,
@@ -148,6 +125,7 @@ fn handle_new_connection_request(
         &mut new_epoll_event(EPOLLIN, connection_fd),
     )?;
     open_connections.push(connection_fd);
+    println!("accepted a connection with fd: {}", connection_fd);
     Ok(())
 }
 
@@ -179,9 +157,6 @@ fn handle_data_on_connection(
     }
 }
 
-fn has_flag(flags_bitmask: u32, flag_to_check: c_int) -> bool {
-    flags_bitmask & flag_to_check as u32 != 0
-}
 
 fn read_connection_fd(buf: &mut [u8; 256], concerned_fd: i32) -> isize {
     let mut first_read_response: Option<isize> = None;
