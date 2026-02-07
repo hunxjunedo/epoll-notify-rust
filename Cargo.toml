@@ -1,5 +1,5 @@
 [package]
-name = "epoll-notifiy-rust"
+name = "epoll-notify-rust"
 version = "0.1.0"
 edition = "2024"
 
