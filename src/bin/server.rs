@@ -1,16 +1,14 @@
 use anyhow::{Ok, Result, bail};
 use libc::{
-    AF_INET, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLLIN, INADDR_ANY, SOCK_NONBLOCK, SOCK_STREAM,
-    accept4, bind, c_int, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
+    AF_INET, EPOLLIN, INADDR_ANY, SOCK_NONBLOCK, SOCK_STREAM,
+    accept4, bind,  close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
     listen, read, sockaddr, sockaddr_in, socket,
 };
 #[path = "../epoll.rs"]
 mod epoll;
 use epoll::{register_interest, unregister_interest, new_epoll_event};
 use std::{
-    io::{Error, ErrorKind},
-    ptr::null_mut,
-    u16,
+    collections::HashMap, io::{Error, ErrorKind}, ptr::null_mut, u16
 };
 
 use crate::epoll::has_flag;
@@ -28,7 +26,8 @@ fn main() -> Result<()> {
     register_interest(epoll_fd, socket_fd, &mut event)?;
 
     let mut epoll_event_recieved = [new_epoll_event(0, 0); 50000];
-    let mut open_connections: Vec<i32> = Vec::new();
+    let mut open_connections: HashMap<i32, String> = HashMap::new();
+    let mut unauthenticated_connections: Vec<i32> = Vec::new();
 
     loop {
         println!("listening");
@@ -45,6 +44,7 @@ fn main() -> Result<()> {
                 socket_fd,
                 epoll_fd,
                 &mut open_connections,
+                &mut unauthenticated_connections
             )?;
         }
         println!("recieved!")
@@ -94,7 +94,8 @@ fn event_handler(
     concerned_fd: i32,
     socket_fd: i32,
     epoll_fd: i32,
-    open_connections: &mut Vec<i32>,
+    open_connections: &mut HashMap<i32, String>,
+    unauthenticated_connections: &mut Vec<i32>
 ) -> Result<()> {
     if has_flag(flags, EPOLLIN) {
         if concerned_fd != socket_fd {
@@ -104,7 +105,7 @@ fn event_handler(
             };
         } else {
             //connection request
-            handle_new_connection_request(socket_fd, epoll_fd, open_connections)?;
+            handle_new_connection_request(socket_fd, epoll_fd, unauthenticated_connections)?;
         }
     };
     Ok(())
@@ -113,7 +114,7 @@ fn event_handler(
 fn handle_new_connection_request(
     socket_fd: i32,
     epoll_fd: i32,
-    open_connections: &mut Vec<i32>,
+    unauthenticated_connections: &mut Vec<i32>,
 ) -> Result<()> {
     let connection_fd = unsafe { accept4(socket_fd, null_mut(), null_mut(), SOCK_NONBLOCK) };
     if connection_fd == -1 {
@@ -124,14 +125,14 @@ fn handle_new_connection_request(
         connection_fd,
         &mut new_epoll_event(EPOLLIN, connection_fd),
     )?;
-    open_connections.push(connection_fd);
+    unauthenticated_connections.push(connection_fd);
     println!("accepted a connection with fd: {}", connection_fd);
     Ok(())
 }
 
 fn handle_data_on_connection(
     connection_fd: i32,
-    open_connections: &mut Vec<i32>,
+    open_connections: &mut HashMap<i32, String>,
     epoll_fd: i32,
 ) -> Result<String> {
     //this event concerns a connection: either FIN or regular data
@@ -141,12 +142,14 @@ fn handle_data_on_connection(
     if first_read_response == 0 {
         //EOF, CLIENT SENT A FIN
         println!("the connection {connection_fd} sent a FIN. Removing and closing it");
-        close_connection(open_connections, connection_fd, epoll_fd)?;
+        open_connections.remove(&connection_fd);
+        close_connection(connection_fd, epoll_fd)?;
         bail!("0")
     } else if first_read_response == -1 {
         //most likely: it's a blockin call prevented, try again later. might be a genuine error in some cases
         println!("error reading connection {connection_fd}");
-        close_connection(open_connections, connection_fd, epoll_fd)?;
+        open_connections.remove(&connection_fd);
+        close_connection(connection_fd, epoll_fd)?;
         bail!("-1")
     } else {
         //everythin was fine
@@ -178,15 +181,9 @@ fn read_connection_fd(buf: &mut [u8; 256], concerned_fd: i32) -> isize {
 }
 
 fn close_connection(
-    open_connections: &mut Vec<i32>,
     connection_fd: i32,
     epoll_fd: i32,
 ) -> Result<()> {
-    let con_index = open_connections
-        .iter()
-        .position(|&e| e == connection_fd)
-        .unwrap();
-    open_connections.remove(con_index);
     unregister_interest(
         epoll_fd,
         connection_fd,
