@@ -1,4 +1,4 @@
-use std::{io::Error, os::raw::c_void, thread, time::Duration};
+use std::{io::Error, os::raw::c_void};
 
 use anyhow::Result;
 use libc::{
@@ -14,6 +14,7 @@ use epoll::{new_epoll_event, register_interest};
 use crate::epoll::has_flag;
 fn main() -> Result<()> {
     let n_connections: u32 = 1000;
+    let mut connections_in_progress = 0;
     let epollfd = unsafe { epoll_create1(0) };
     let mut connections_active: Vec<i32> = Vec::new();
 
@@ -46,12 +47,14 @@ fn main() -> Result<()> {
         };
         if connection_response == -1 {
             if Error::last_os_error().raw_os_error().unwrap() == EINPROGRESS {
+                //Cool, cuz it non-blocking socket
                 //error kind not yet available in stable
                 register_interest(
                     epollfd,
                     connection_socket_fd,
                     &mut new_epoll_event(EPOLLOUT | EPOLLIN, connection_socket_fd),
                 )?;
+                connections_in_progress += 1;
                 println!(
                     "the connection {} is in progress, registered interest.",
                     connection_socket_fd
@@ -70,12 +73,19 @@ fn main() -> Result<()> {
         }
     }
 
-    //2. the main loop
+    //2. the loop for initiating connections
     loop {
-        //todo: a threadpool for further time-cutting
+        if connections_in_progress == 0 {
+            //exit the connection loop if all connections reolved
+            println!("all connections have been resolved, exiting the connection loop");
+            break
+        }
+        //todo: a threadpool for further parallelism
         let mut events_buffer: [epoll_event; 5000] = [new_epoll_event(0, 0); 5000]; //rest will round robin, no starvation :)
+        //safe to say that this is the number of connections resolved, because no other interest has been registered at this point
         let events_occured =
             unsafe { epoll_wait(epollfd, events_buffer.as_mut_ptr(), 5000, -1) } as usize;
+        connections_in_progress -= events_occured;
         println!("woke up for {events_occured} events");
         for i in 0..events_occured {
             //we know that the event is bound to take place on a connection fd, no verif required
