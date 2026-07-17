@@ -1,15 +1,18 @@
-use std::{io::Error, os::raw::c_void};
+use std::{io::Error, os::raw::c_void, thread, time::Duration};
 
 use anyhow::Result;
 use libc::{
     AF_INET, EINPROGRESS, EPOLL_CTL_MOD, EPOLLIN, EPOLLOUT, SO_ERROR, SOCK_NONBLOCK, SOCK_STREAM,
     SOL_SOCKET, close, connect, epoll_create1, epoll_ctl, epoll_event, epoll_wait, getsockopt,
-    htons, in_addr, sockaddr, sockaddr_in, socket, socklen_t,
+    htons, in_addr, sockaddr, sockaddr_in, socket, socklen_t, write,
 };
 use std::net::Ipv4Addr;
 #[path = "../epoll.rs"]
 mod epoll;
+#[path = "../protocol.rs"]
+mod protocol;
 use epoll::{new_epoll_event, register_interest};
+use protocol::Message;
 
 use crate::epoll::has_flag;
 fn main() -> Result<()> {
@@ -131,6 +134,26 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    for (i, &fd) in connections_active.iter().enumerate() {
+        let msg = Message::Auth {
+            id: format!("client-{i}"),
+            password: "x".into(),
+        }
+        .to_raw_message();
+        let bytes = msg.as_bytes();
+        let written = unsafe { write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+        if written < 0 {
+            println!("auth write failed on fd={fd}: {}", Error::last_os_error());
+        }
+    }
+
     //CONFIRMED: does not send FIN until process exits
-    Ok(())
+    println!(
+        "holding {} connections open; Ctrl-C to exit",
+        connections_active.len()
+    );
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
 }
