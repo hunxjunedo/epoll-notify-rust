@@ -1,8 +1,8 @@
 use anyhow::{Ok, Result, bail};
 use libc::{
-    AF_INET, EPOLLIN, INADDR_ANY, SOCK_NONBLOCK, SOCK_STREAM,
-    accept4, bind,  close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
-    listen, read, sockaddr, sockaddr_in, socket,
+    AF_INET, EPOLLIN, INADDR_ANY, SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, SOMAXCONN,
+    accept4, bind, c_int, close, epoll_create1, epoll_ctl, epoll_event, epoll_wait, htons, in_addr,
+    listen, read, setsockopt, sockaddr, sockaddr_in, socket,
 };
 #[path = "../epoll.rs"]
 mod epoll;
@@ -27,7 +27,8 @@ fn main() -> Result<()> {
 
     let mut epoll_event_recieved = [new_epoll_event(0, 0); 50000];
     let mut open_connections: HashMap<i32, String> = HashMap::new();
-    let mut unauthenticated_connections: Vec<i32> = Vec::new();
+    // deferred: auth path (unauthenticated_connections -> open_connections via AUTH)
+    // let mut unauthenticated_connections: Vec<i32> = Vec::new();
 
     loop {
         println!("listening");
@@ -44,7 +45,6 @@ fn main() -> Result<()> {
                 socket_fd,
                 epoll_fd,
                 &mut open_connections,
-                &mut unauthenticated_connections
             )?;
         }
         println!("recieved!")
@@ -56,6 +56,20 @@ fn start_listening(port: u16) -> Result<i32> {
     if socket_fd < 0 {
         bail!("could not instantiate a socket: {}", Error::last_os_error());
     };
+
+    let reuse: c_int = 1;
+    if unsafe {
+        setsockopt(
+            socket_fd,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse as *const _ as *const _,
+            size_of_val(&reuse) as u32,
+        )
+    } < 0
+    {
+        bail!("could not set SO_REUSEADDR: {}", Error::last_os_error());
+    }
 
     let address_to_listen = sockaddr_in {
         sin_family: AF_INET as u16,
@@ -79,7 +93,7 @@ fn start_listening(port: u16) -> Result<i32> {
         );
     }
 
-    if unsafe { listen(socket_fd, 10) } < 0 {
+    if unsafe { listen(socket_fd, SOMAXCONN) } < 0 {
         bail!(
             "could not listen the TCP socket on given address: {}",
             Error::last_os_error()
@@ -99,7 +113,12 @@ fn event_handler(
 ) -> Result<()> {
     if has_flag(flags, EPOLLIN) {
         if concerned_fd != socket_fd {
-            let recieved_data = handle_data_on_connection(concerned_fd, open_connections, epoll_fd);
+            let recieved_data = handle_data_on_connection(
+                concerned_fd,
+                open_connections,
+                unauthenticated_connections,
+                epoll_fd,
+            );
             if recieved_data.is_ok(){
                 println!("{}",recieved_data.unwrap());
             };
@@ -116,23 +135,30 @@ fn handle_new_connection_request(
     epoll_fd: i32,
     unauthenticated_connections: &mut Vec<i32>,
 ) -> Result<()> {
-    let connection_fd = unsafe { accept4(socket_fd, null_mut(), null_mut(), SOCK_NONBLOCK) };
-    if connection_fd == -1 {
-        bail!("could not accept a connection request: {}", Error::last_os_error());
+    loop {
+        let connection_fd = unsafe { accept4(socket_fd, null_mut(), null_mut(), SOCK_NONBLOCK) };
+        if connection_fd == -1 {
+            let err = Error::last_os_error();
+            if err.kind() == ErrorKind::WouldBlock {
+                break;
+            }
+            bail!("could not accept a connection request: {err}");
+        }
+        register_interest(
+            epoll_fd,
+            connection_fd,
+            &mut new_epoll_event(EPOLLIN, connection_fd),
+        )?;
+        unauthenticated_connections.push(connection_fd);
+        println!("accepted a connection with fd: {}", connection_fd);
     }
-    register_interest(
-        epoll_fd,
-        connection_fd,
-        &mut new_epoll_event(EPOLLIN, connection_fd),
-    )?;
-    unauthenticated_connections.push(connection_fd);
-    println!("accepted a connection with fd: {}", connection_fd);
     Ok(())
 }
 
 fn handle_data_on_connection(
     connection_fd: i32,
     open_connections: &mut HashMap<i32, String>,
+    unauthenticated_connections: &mut Vec<i32>,
     epoll_fd: i32,
 ) -> Result<String> {
     //this event concerns a connection: either FIN or regular data
@@ -143,19 +169,25 @@ fn handle_data_on_connection(
         //EOF, CLIENT SENT A FIN
         println!("the connection {connection_fd} sent a FIN. Removing and closing it");
         open_connections.remove(&connection_fd);
+        unauthenticated_connections.retain(|&fd| fd != connection_fd);
         close_connection(connection_fd, epoll_fd)?;
         bail!("0")
     } else if first_read_response == -1 {
         //most likely: it's a blockin call prevented, try again later. might be a genuine error in some cases
         println!("error reading connection {connection_fd}");
         open_connections.remove(&connection_fd);
+        unauthenticated_connections.retain(|&fd| fd != connection_fd);
         close_connection(connection_fd, epoll_fd)?;
         bail!("-1")
     } else {
         //everythin was fine
         println!("connection {connection_fd} sent some data");
         //try to convert to utf-8
-        let text = String::from_utf8(buf.to_vec())?;
+        let text = String::from_utf8_lossy(&buf[..first_read_response as usize]).into_owned();
+        if let Message::Auth { id, password: _ } = Message::from_raw_message(text.clone()) {
+            unauthenticated_connections.retain(|&fd| fd != connection_fd);
+            open_connections.insert(connection_fd, id);
+        }
         Ok(text)
     }
 }
