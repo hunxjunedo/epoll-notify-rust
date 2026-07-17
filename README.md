@@ -1,29 +1,28 @@
 # epoll-notify-rust
 
-This repository is a small Rust experiment for exploring Linux epoll and non-blocking TCP sockets. It is meant as a learning project for observing how an event-driven server handles many connections rather than as a production-ready messaging system.
+A small Linux-only Rust experiment for stress-testing **epoll with many concurrent TCP connections**.
 
-## What this project does
+TCP connect/accept and a tiny auth handshake exist as scaffolding so sockets stay open and identifiable. The point of the project is observing an epoll event loop under many FDs, not building a messaging product.
 
-The code shows a basic server/client setup built around:
+## What you get
 
-- Linux epoll for waiting on many sockets
-- non-blocking TCP connections
-- a simple event loop for incoming activity
-- low-level libc bindings for networking primitives
+| Binary | Role |
+|--------|------|
+| `server` | Non-blocking listen socket + epoll loop: accept, authenticate, track open FDs |
+| `client` | Opens many non-blocking TCP connections, authenticates each, then holds them open |
 
-## Current scope
+Shared helpers:
 
-The project is intentionally narrow. It focuses on the mechanics of connection handling and epoll-driven event processing.
+- `src/epoll.rs` — thin wrappers around `epoll_ctl` / event structs
+- `src/protocol.rs` — minimal framing for `AUTH` / `TEXT` / `CLOSE`
 
-## Project layout
+## Requirements
 
-- src/epoll.rs: helpers for epoll registration and event creation
-- src/bin/server.rs: a simple TCP server using epoll
-- src/bin/client.rs: a basic client that opens connections to the server
+- Linux (uses `epoll`, `accept4`, etc.)
+- Rust toolchain (`cargo`)
+- Enough file descriptors for your target connection count (`ulimit -n`)
 
 ## Build
-
-From the repository root, run:
 
 ```bash
 cargo build
@@ -31,20 +30,33 @@ cargo build
 
 ## Run
 
-Start the server:
+Terminal 1 — start the server:
 
 ```bash
 cargo run --bin server
 ```
 
-In another terminal, start the client:
+Terminal 2 — open many connections (currently hard-coded to 1000):
 
 ```bash
 cargo run --bin client
 ```
 
+Both processes keep running. The client parks after connects + auth so the sockets stay open. Stop either side with **Ctrl-C**.
+
+## Layout
+
+```
+src/
+  epoll.rs          epoll helpers
+  protocol.rs       AUTH / TEXT / CLOSE framing
+  bin/server.rs     epoll TCP server
+  bin/client.rs     many-connection client
+```
+
 ## Notes
 
-- This project is Linux-specific and relies on epoll.
-- It binds to port 8080, so that port should be available.
-- The code is experimental and intended for learning and experimentation.
+- Linux-specific; binds to port 8080.
+- Auth is minimal: client id + dummy password; server stores `fd → id` in `open_connections`.
+- A future step is a client thread pool to drive traffic across the held connections.
+- This is a learning/experiment repo, not a production service.
