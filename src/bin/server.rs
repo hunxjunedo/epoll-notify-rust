@@ -6,7 +6,10 @@ use libc::{
 };
 #[path = "../epoll.rs"]
 mod epoll;
+#[path = "../protocol.rs"]
+mod protocol;
 use epoll::{register_interest, unregister_interest, new_epoll_event};
+use protocol::Message;
 use std::{
     collections::HashMap, io::{Error, ErrorKind}, ptr::null_mut, u16
 };
@@ -27,8 +30,7 @@ fn main() -> Result<()> {
 
     let mut epoll_event_recieved = [new_epoll_event(0, 0); 50000];
     let mut open_connections: HashMap<i32, String> = HashMap::new();
-    // deferred: auth path (unauthenticated_connections -> open_connections via AUTH)
-    // let mut unauthenticated_connections: Vec<i32> = Vec::new();
+    let mut unauthenticated_connections: Vec<i32> = Vec::new();
 
     loop {
         println!("listening");
@@ -45,6 +47,7 @@ fn main() -> Result<()> {
                 socket_fd,
                 epoll_fd,
                 &mut open_connections,
+                &mut unauthenticated_connections,
             )?;
         }
         println!("recieved!")
@@ -109,7 +112,7 @@ fn event_handler(
     socket_fd: i32,
     epoll_fd: i32,
     open_connections: &mut HashMap<i32, String>,
-    unauthenticated_connections: &mut Vec<i32>
+    unauthenticated_connections: &mut Vec<i32>,
 ) -> Result<()> {
     if has_flag(flags, EPOLLIN) {
         if concerned_fd != socket_fd {
