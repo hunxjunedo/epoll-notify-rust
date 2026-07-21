@@ -1,6 +1,6 @@
 use std::{io::Error, os::raw::c_void, thread, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use libc::{
     AF_INET, EINPROGRESS, EPOLL_CTL_MOD, EPOLLIN, EPOLLOUT, SO_ERROR, SOCK_NONBLOCK, SOCK_STREAM,
     SOL_SOCKET, close, connect, epoll_create1, epoll_ctl, epoll_event, epoll_wait, getsockopt,
@@ -16,7 +16,12 @@ use protocol::Message;
 
 use crate::epoll::has_flag;
 fn main() -> Result<()> {
-    let n_connections: u32 = 1000;
+    let n_connections: u32 = match std::env::args().nth(1) {
+        Some(s) => s.parse().map_err(|_| {
+            anyhow::anyhow!("connection count must be a positive integer, got `{s}`")
+        })?,
+        None => bail!("usage: cargo run --bin client -- <n_connections>"),
+    };
     let mut connections_in_progress = 0;
     let epollfd = unsafe { epoll_create1(0) };
     let mut connections_active: Vec<i32> = Vec::new();

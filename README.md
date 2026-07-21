@@ -36,11 +36,20 @@ Terminal 1 — start the server:
 cargo run --bin server
 ```
 
-Terminal 2 — open many connections (currently hard-coded to 1000):
+Terminal 2 — open connections (pass the count as a CLI argument):
 
 ```bash
-cargo run --bin client
+cargo run --bin client -- 1000
 ```
+
+Examples:
+
+```bash
+cargo run --bin client -- 100      # small smoke test
+cargo run --bin client -- 5000     # heavier run (check ulimit -n first)
+```
+
+The client requires `<n_connections>`; there is no default.
 
 Both processes keep running. The client parks after connects + AUTH so the sockets stay open. Stop either side with **Ctrl-C**.
 
